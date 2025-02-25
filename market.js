@@ -418,10 +418,109 @@ async function claimWinnings(ammContract, outcomeAsset) {
 }
 
 /**
- * Main flow: Create market, add liquidity, wait 1 minute, perform swap, resolve market, claim winnings,
- * and then verify valid outputs.
- * Random tickers are generated each time to avoid conflicts.
+ * Deposit collateral (USDC/BTC) and either mint outcome tokens or directly swap collateral for outcome tokens.
  */
+async function depositCollateralAndMintOrSwap(
+  ammContract,
+  collateralAsset,
+  depositAmount,
+  outcomeAsset,
+  slippagePercentage
+) {
+  // Get the current AMM state.
+  const contractState = await client.getContractState(
+    ammContract[0],
+    ammContract[1]
+  );
+  const assetKeys = Object.keys(contractState.collateralized.amounts);
+  const outcomeAssetKey = assetKeys.find((key) => key.includes(outcomeAsset));
+  if (!outcomeAssetKey) {
+    throw new Error(`${outcomeAsset} asset not found in AMM contract`);
+  }
+  const inputTotal = parseInt(
+    contractState.collateralized.amounts[outcomeAssetKey]
+  );
+  const outputTotal = parseInt(
+    contractState.collateralized.amounts[collateralAsset]
+  );
+  const outputAmount = Math.floor(
+    outputTotal - (inputTotal * outputTotal) / (inputTotal + depositAmount)
+  );
+  if (outputAmount <= 0) {
+    throw new Error("Calculated output amount is 0");
+  }
+  const minOutput = Math.floor(
+    outputAmount - (outputAmount * slippagePercentage) / 100
+  );
+  console.log(
+    `Depositing ${depositAmount} ${collateralAsset}: calculated output = ${outputAmount} ${outcomeAsset} tokens, with minimum acceptable = ${minOutput}`
+  );
+
+  // Build the transaction.
+  const tx = {
+    contract_call: {
+      contract: ammContract,
+      call_type: {
+        swap: {
+          pointer: 1,
+          assert_values: { min_out_value: minOutput.toString() },
+        },
+      },
+    },
+    transfer: {
+      transfers: [
+        {
+          asset: collateralAsset,
+          output: 2,
+          amount: depositAmount.toString(),
+        },
+      ],
+    },
+  };
+
+  // Define fee outputs.
+  const nonFeeOutputs = [
+    { script: txBuilder.compile(tx), value: 0 }, // OP_RETURN output with tx message.
+    { address, value: 546 },
+    { address, value: 546 },
+  ];
+
+  // Fetch UTXOs to fund the fee.
+  const utxos = await electrumFetchNonGlittrUtxos(
+    client.electrumApi,
+    API_KEY,
+    address
+  );
+  const nonFeeInputs = []; // leaving empty so fee inputs are selected automatically
+
+  // Use addFeeToTx to get fee inputs and adjusted outputs.
+  const { inputs, outputs } = await addFeeToTx(
+    NETWORK,
+    address,
+    utxos,
+    nonFeeInputs,
+    nonFeeOutputs
+  );
+
+  // Broadcast the raw transaction with the fee inputs.
+  const txid = await client.createAndBroadcastRawTx({
+    account: account.p2tr(),
+    inputs,
+    outputs,
+  });
+  console.log(`Collateral deposit TXID: ${txid}`);
+  console.log("[+] Waiting for collateral deposit transaction to be mined...");
+  while (true) {
+    try {
+      const message = await client.getGlittrMessageByTxId(txid);
+      console.log("Collateral deposit mined:", JSON.stringify(message));
+      break;
+    } catch (error) {
+      await delay(1000);
+    }
+  }
+}
+
 async function main() {
   // Generate random suffix for tickers to ensure uniqueness.
   const randomSuffix = Math.floor(Math.random() * 1000000);
@@ -469,7 +568,27 @@ async function main() {
 
   // Debug: Verify valid outputs after resolution and claims
   await verifyValidOutputs(address, API_KEY);
+
+  // New user flow: Deposit collateral and mint outcome tokens or swap collateral for outcome tokens
+  console.log(
+    "=== New user flow: Deposit collateral and mint outcome tokens or swap collateral for outcome tokens ==="
+  );
+  const collateralAsset = ["BTC", "0"]; // Example collateral asset (BTC)
+  const collateralDepositAmount = 0.01; // Example deposit amount in BTC
+  const outcomeAsset = "YES"; // Example outcome asset to receive
+  const slippagePercentage = 10; // 10% slippage tolerance
+  await depositCollateralAndMintOrSwap(
+    ammContract,
+    collateralAsset,
+    collateralDepositAmount,
+    outcomeAsset,
+    slippagePercentage
+  );
 }
+
+main().catch((error) => {
+  console.error("Error:", error);
+});
 
 main().catch((error) => {
   console.error("Error:", error);
