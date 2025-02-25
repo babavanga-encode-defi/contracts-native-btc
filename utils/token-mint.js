@@ -4,7 +4,7 @@ async function deployFreeMintContract() {
   const NETWORK = "regtest";
   const client = new GlittrSDK({
     network: NETWORK,
-    apiKey: "your-api-key",
+    apiKey: "ccc80ba0-e813-41ed-8a62-1ea0560688e7",
     glittrApi: "https://devnet-core-api.glittr.fi", // devnet
     electrumApi: "https://devnet-electrum.glittr.fi", // devnet
   });
