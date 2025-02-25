@@ -1,10 +1,18 @@
-import { Account, GlittrSDK } from "@glittr-sdk/sdk";
+import {
+  Account,
+  GlittrSDK,
+  electrumFetchNonGlittrUtxos,
+  txBuilder,
+  addFeeToTx,
+} from "@glittr-sdk/sdk";
+
 import { schnorr, getPublicKey } from "@noble/secp256k1";
 import { sha256 } from "bitcoinjs-lib/src/crypto.js";
 
 const NETWORK = "regtest";
 const API_KEY = "ccc80ba0-e813-41ed-8a62-1ea0560688e7";
-const WIF = "cW84FgWG9U1MpKvdzZMv4JZKLSU7iFAzMmXjkGvGUvh5WvhrEASj";
+// const WIF = "cW84FgWG9U1MpKvdzZMv4JZKLSU7iFAzMmXjkGvGUvh5WvhrEASj";
+const WIF = "cTFZ5Bm9euMZWcAxZEmCXKr228WFY37QSsU9TgSZ65SAt4QTUhWU";
 
 // Initialize the Glittr client and our account.
 const client = new GlittrSDK({
@@ -15,6 +23,26 @@ const client = new GlittrSDK({
 });
 const account = new Account({ wif: WIF, network: NETWORK });
 const address = account.p2tr().address;
+
+// Helper delay function
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Debug: Fetch and log valid outputs (UTXOs) for a given address.
+ */
+async function verifyValidOutputs(addr, apiKey) {
+  const url = `https://devnet-core-api.glittr.fi/helper/address/${addr}/valid-outputs`;
+  try {
+    const res = await fetch(url, { headers: { Authorization: apiKey } });
+    const data = await res.json();
+    console.log("=== Valid Outputs for Address ===");
+    console.log(JSON.stringify(data, null, 2));
+  } catch (error) {
+    console.error("Error fetching valid outputs:", error);
+  }
+}
 
 /**
  * Create an outcome asset (MOA) with a given ticker (e.g., "YES" or "NO")
@@ -47,11 +75,10 @@ async function createOutcomeAsset(ticker) {
     try {
       const message = await client.getGlittrMessageByTxId(txid);
       console.log(`${ticker} asset mined:`, JSON.stringify(message));
-      // Parse the block_tx field (format "height:order") into a tuple.
       const [block, order] = message.block_tx.split(":").map(Number);
       return [block, order];
     } catch (error) {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await delay(1000);
     }
   }
 }
@@ -83,20 +110,21 @@ async function mintAsset(contract, pointer = 1) {
       console.log("Mint mined:", JSON.stringify(message));
       break;
     } catch (error) {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await delay(1000);
     }
   }
 }
 
 /**
  * Create an AMM contract (MBA) that uses the YES and NO tokens as collateral.
+ * The AMM ticker is passed as an argument.
  */
-async function createAMMContract(yesContract, noContract) {
+async function createAMMContract(yesContract, noContract, ammTicker) {
   const tx = {
     contract_creation: {
       contract_type: {
         mba: {
-          ticker: "AMM-market-1", // Change as desired
+          ticker: ammTicker, // Use the random AMM ticker
           divisibility: 18,
           live_time: 0,
           mint_mechanism: {
@@ -135,7 +163,7 @@ async function createAMMContract(yesContract, noContract) {
       const [block, order] = message.block_tx.split(":").map(Number);
       return [block, order];
     } catch (error) {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await delay(1000);
     }
   }
 }
@@ -149,7 +177,6 @@ async function depositLiquidity(
   noContract,
   depositAmount
 ) {
-  // Fetch the UTXOs holding the YES and NO tokens.
   const inputYes = await client.getAssetUtxos(
     address,
     `${yesContract[0]}:${yesContract[1]}`
@@ -169,7 +196,6 @@ async function depositLiquidity(
     throw new Error("Insufficient balance to deposit liquidity");
   }
 
-  // Create a contract call to mint AMM LP tokens.
   const tx = {
     contract_call: {
       contract: ammContract,
@@ -207,15 +233,18 @@ async function depositLiquidity(
       console.log("Liquidity deposit mined:", JSON.stringify(message));
       break;
     } catch (error) {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await delay(1000);
     }
   }
 }
 
 /**
  * Perform a swap of one outcome token for the other.
- * This function calculates the expected output based on the constant product formula
- * and applies a slippage tolerance.
+ */
+/**
+ * Perform a swap of one outcome token for the other.
+ * This version gathers fee inputs using addFeeToTx and uses createAndBroadcastRawTx,
+ * ensuring that inputs are properly signed.
  */
 async function performSwap(
   ammContract,
@@ -223,13 +252,12 @@ async function performSwap(
   swapAmount,
   slippagePercentage
 ) {
-  // Fetch current AMM state.
+  // Get the current AMM state.
   const contractState = await client.getContractState(
     ammContract[0],
     ammContract[1]
   );
   const assetKeyInput = `${inputAsset[0]}:${inputAsset[1]}`;
-  // Determine the output asset key (the one that is not the input).
   const assetKeys = Object.keys(contractState.collateralized.amounts);
   const assetKeyOutput = assetKeys.find((key) => key !== assetKeyInput);
   if (!assetKeyOutput) {
@@ -254,6 +282,7 @@ async function performSwap(
     `Swapping ${swapAmount} tokens: calculated output = ${outputAmount}, with minimum acceptable = ${minOutput}`
   );
 
+  // Build the swap transaction.
   const tx = {
     contract_call: {
       contract: ammContract,
@@ -275,13 +304,35 @@ async function performSwap(
     },
   };
 
-  const outputs = [
+  // Define fee outputs.
+  const nonFeeOutputs = [
+    { script: txBuilder.compile(tx), value: 0 }, // OP_RETURN output with tx message.
     { address, value: 546 },
     { address, value: 546 },
   ];
-  const txid = await client.createAndBroadcastTx({
+
+  // Fetch UTXOs to fund the fee.
+  const utxos = await electrumFetchNonGlittrUtxos(
+    client.electrumApi,
+    API_KEY,
+    address
+  );
+  // (Optionally, you could also include specific asset UTXOs as nonFeeInputs.)
+  const nonFeeInputs = []; // leaving empty so fee inputs are selected automatically
+
+  // Use addFeeToTx to get fee inputs and adjusted outputs.
+  const { inputs, outputs } = await addFeeToTx(
+    NETWORK,
+    address,
+    utxos,
+    nonFeeInputs,
+    nonFeeOutputs
+  );
+
+  // Broadcast the raw transaction with the fee inputs.
+  const txid = await client.createAndBroadcastRawTx({
     account: account.p2tr(),
-    tx,
+    inputs,
     outputs,
   });
   console.log(`Swap TXID: ${txid}`);
@@ -292,14 +343,13 @@ async function performSwap(
       console.log("Swap mined:", JSON.stringify(message));
       break;
     } catch (error) {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await delay(1000);
     }
   }
 }
 
 /**
  * Generate an Oracle Commitment for market resolution.
- * The oracle message includes a market identifier, the winning outcome, and the block height.
  */
 async function getOracleCommitment(winningOutcome) {
   const currentBlockHeight = 880000; // Ideally, fetch this dynamically
@@ -325,8 +375,6 @@ async function getOracleCommitment(winningOutcome) {
 
 /**
  * Resolve the market using an oracle commitment.
- * This function submits a resolution transaction that includes the oracle commitment,
- * determining the winning outcome.
  */
 async function resolveMarket(ammContract, winningOutcome) {
   console.log(`Resolving market with winning outcome: ${winningOutcome}`);
@@ -356,52 +404,71 @@ async function resolveMarket(ammContract, winningOutcome) {
       console.log("Market resolution mined:", JSON.stringify(message));
       break;
     } catch (error) {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await delay(1000);
     }
   }
 }
 
 /**
  * Placeholder for claiming winnings.
- * Users would exchange their winning outcome tokens for collateral.
  */
 async function claimWinnings(ammContract, outcomeAsset) {
   console.log("Claiming winnings using outcome asset", outcomeAsset);
-  // Implement your claim logic here, such as a contract_call to convert winning tokens.
+  // Implement your claim logic here.
 }
 
 /**
- * Main flow: Create market, add liquidity, swap tokens, resolve market, and claim winnings.
+ * Main flow: Create market, add liquidity, wait 1 minute, perform swap, resolve market, claim winnings,
+ * and then verify valid outputs.
+ * Random tickers are generated each time to avoid conflicts.
  */
 async function main() {
+  // Generate random suffix for tickers to ensure uniqueness.
+  const randomSuffix = Math.floor(Math.random() * 1000000);
+  const yesTicker = "test_yes_" + randomSuffix;
+  const noTicker = "test_no_" + randomSuffix;
+  const ammTicker = "AMM-market-" + randomSuffix;
+
   console.log("=== Creating outcome assets for the prediction market ===");
-  const yesAsset = await createOutcomeAsset("test_yes_123");
-  const noAsset = await createOutcomeAsset("test_no_123");
+  console.log(account.p2tr().address);
+
+  const yesAsset = await createOutcomeAsset(yesTicker);
+  const noAsset = await createOutcomeAsset(noTicker);
 
   console.log("=== Minting outcome tokens ===");
   await mintAsset(yesAsset);
   await mintAsset(noAsset);
 
   console.log("=== Creating the AMM contract for the prediction market ===");
-  const ammContract = await createAMMContract(yesAsset, noAsset);
+  const ammContract = await createAMMContract(yesAsset, noAsset, ammTicker);
+
+  console.log("=== Waiting 1 minute before depositing liquidity ===");
+  await delay(60000);
 
   console.log("=== Depositing liquidity into the AMM ===");
   const depositAmount = 100; // Adjust as needed
   await depositLiquidity(ammContract, yesAsset, noAsset, depositAmount);
 
+  console.log("=== Waiting 1 minute before performing swap ===");
+  await delay(80000);
+
+  // // Debug: Verify valid outputs after liquidity deposit
+  // await verifyValidOutputs(address, API_KEY);
+
   console.log("=== Performing a swap (example: swap 10 YES tokens) ===");
-  const swapAmount = 10;
+  const swapAmount = 100;
   const slippage = 10; // 10% tolerance
   await performSwap(ammContract, yesAsset, swapAmount, slippage);
 
   console.log("=== Simulating market resolution ===");
-  // In a real market, the outcome would come from an oracle.
   const winningOutcome = "YES";
   await resolveMarket(ammContract, winningOutcome);
 
   console.log("=== Claiming winnings ===");
-  // If YES wins, users holding YES tokens would claim winnings.
   await claimWinnings(ammContract, yesAsset);
+
+  // Debug: Verify valid outputs after resolution and claims
+  await verifyValidOutputs(address, API_KEY);
 }
 
 main().catch((error) => {
